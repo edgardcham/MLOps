@@ -20,3 +20,5 @@ penguins.db
 sample.json
 
 mlflow.db
+
+.python-version
