@@ -237,39 +237,46 @@ class Training(FlowSpec, FlowMixin):
         the model using the test data for this fold.
         """
         import mlflow
+        from sklearn.metrics import precision_score, recall_score
+        import numpy as np
 
         logging.info("Evaluating fold %d...", self.fold)
 
-        # Let's evaluate the model using the test data we processed and stored as
-        # artifacts during the `transform` step.
-        self.loss, self.accuracy = self.model.evaluate(
-            self.x_test,
-            self.y_test,
-            verbose=2,
-        )
+        # Predict the test data
+        y_pred = np.argmax(self.model.predict(self.x_test), axis=1)
+        y_true = np.argmax(self.y_test, axis=1)
+
+        # Compute metrics for this fold
+        self.loss, self.accuracy = self.model.evaluate(self.x_test, self.y_test, verbose=2)
+        self.precision = precision_score(y_true, y_pred, average="weighted")
+        self.recall = recall_score(y_true, y_pred, average="weighted")
 
         logging.info(
-            "Fold %d - loss: %f - accuracy: %f",
+            "Fold %d - loss: %f - accuracy: %f - precision: %f - recall: %f",
             self.fold,
             self.loss,
             self.accuracy,
+            self.precision,
+            self.recall,
         )
 
-        # Let's log everything under the same nested run we created when training the
-        # current fold's model.
+        # Log metrics to the nested MLflow run for this fold
         mlflow.set_tracking_uri(self.mlflow_tracking_uri)
         with mlflow.start_run(run_id=self.mlflow_fold_run_id):
             mlflow.log_metrics(
                 {
                     "test_loss": self.loss,
                     "test_accuracy": self.accuracy,
-                },
+                    "test_precision": self.precision,
+                    "test_recall": self.recall,
+                }
             )
 
         # When we finish evaluating every fold in the cross-validation process, we want
         # to evaluate the overall performance of the model by averaging the scores from
         # each fold.
         self.next(self.evaluate_model)
+
 
     @card
     @step
@@ -282,23 +289,31 @@ class Training(FlowSpec, FlowMixin):
         import mlflow
         import numpy as np
 
-        # We need access to the `mlflow_run_id` and `mlflow_tracking_uri` artifacts
-        # that we set at the start of the flow, but since we are in a join step, we
-        # need to merge the artifacts from the incoming branches to make them
-        # available.
+        # Merge artifacts from the incoming branches (fold evaluations)
         self.merge_artifacts(inputs, include=["mlflow_run_id", "mlflow_tracking_uri"])
 
-        # Let's calculate the mean and standard deviation of the accuracy and loss from
-        # all the cross-validation folds. Notice how we are accumulating these values
-        # using the `inputs` parameter provided by Metaflow.
-        metrics = [[i.accuracy, i.loss] for i in inputs]
-        self.accuracy, self.loss = np.mean(metrics, axis=0)
-        self.accuracy_std, self.loss_std = np.std(metrics, axis=0)
+        # Aggregate metrics across folds
+        accuracies = [i.accuracy for i in inputs]
+        losses = [i.loss for i in inputs]
+        precisions = [i.precision for i in inputs]
+        recalls = [i.recall for i in inputs]
+
+        # Calculate averages and standard deviations
+        self.accuracy = np.mean(accuracies)
+        self.accuracy_std = np.std(accuracies)
+        self.loss = np.mean(losses)
+        self.loss_std = np.std(losses)
+        self.precision = np.mean(precisions)
+        self.precision_std = np.std(precisions)
+        self.recall = np.mean(recalls)
+        self.recall_std = np.std(recalls)
 
         logging.info("Accuracy: %f ±%f", self.accuracy, self.accuracy_std)
         logging.info("Loss: %f ±%f", self.loss, self.loss_std)
+        logging.info("Precision: %f ±%f", self.precision, self.precision_std)
+        logging.info("Recall: %f ±%f", self.recall, self.recall_std)
 
-        # Let's log the model metrics on the parent run.
+        # Log aggregated metrics to MLflow
         mlflow.set_tracking_uri(self.mlflow_tracking_uri)
         with mlflow.start_run(run_id=self.mlflow_run_id):
             mlflow.log_metrics(
@@ -307,13 +322,16 @@ class Training(FlowSpec, FlowMixin):
                     "cross_validation_accuracy_std": self.accuracy_std,
                     "cross_validation_loss": self.loss,
                     "cross_validation_loss_std": self.loss_std,
-                },
+                    "cross_validation_precision": self.precision,
+                    "cross_validation_precision_std": self.precision_std,
+                    "cross_validation_recall": self.recall,
+                    "cross_validation_recall_std": self.recall_std,
+                }
             )
 
-        # After we finish evaluating the cross-validation process, we can send the flow
-        # to the registration step to register where we'll register the final version of
-        # the model.
+        # Proceed to the model registration step
         self.next(self.register_model)
+
 
     @card
     @step
@@ -389,33 +407,48 @@ class Training(FlowSpec, FlowMixin):
         """Register the model in the Model Registry.
 
         This function will prepare and register the final model in the Model Registry.
-        This will be the model that we trained using the entire dataset.
-
-        We'll only register the model if its accuracy is above a predefined threshold.
+        The model will only be registered if its accuracy is higher than the accuracy
+        of the currently registered model in MLflow.
         """
         import tempfile
-
         import mlflow
+        from mlflow.tracking import MlflowClient
 
-        # Since this is a join step, we need to merge the artifacts from the incoming
-        # branches to make them available here.
+        # Merge artifacts from the incoming branches
         self.merge_artifacts(inputs)
 
-        # We only want to register the model if its accuracy is above the threshold
-        # specified by the `accuracy_threshold` parameter.
-        if self.accuracy >= self.accuracy_threshold:
-            logging.info("Registering model...")
+        # Initialize MLflow Client
+        client = MlflowClient()
 
-            # We'll register the model under the experiment we started at the beginning
-            # of the flow. We also need to create a temporary directory to store the
-            # model artifacts.
+        # Get the latest registered model's accuracy
+        try:
+            model_versions = client.get_latest_versions("penguins")
+            if model_versions:
+                # Assume the latest model has the highest accuracy (optional: sort to confirm)
+                latest_version = model_versions[-1]
+                latest_run_id = latest_version.run_id
+                latest_run = client.get_run(latest_run_id)
+                latest_accuracy = float(latest_run.data.metrics["cross_validation_accuracy"])
+                logging.info("Latest registered model accuracy: %f", latest_accuracy)
+            else:
+                latest_accuracy = 0.0  # No models in the registry yet
+                logging.info("No previously registered models found.")
+        except Exception as e:
+            latest_accuracy = 0.0
+            logging.warning("Failed to retrieve the latest model's accuracy: %s", e)
+
+        # Check if the current model's accuracy exceeds the latest registered model's accuracy
+        if self.accuracy > latest_accuracy:
+            logging.info("Current model accuracy (%f) exceeds the latest model accuracy (%f).", self.accuracy, latest_accuracy)
+            logging.info("Registering the model...")
+
+            # Register the model in MLflow
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
             with (
                 mlflow.start_run(run_id=self.mlflow_run_id),
                 tempfile.TemporaryDirectory() as directory,
             ):
-                # We can now register the model using the name "penguins" in the Model
-                # Registry. This will automatically create a new version of the model.
+                # Prepare artifacts for registration
                 mlflow.pyfunc.log_model(
                     python_model=Model(data_capture=False),
                     registered_model_name="penguins",
@@ -424,21 +457,19 @@ class Training(FlowSpec, FlowMixin):
                     artifacts=self._get_model_artifacts(directory),
                     pip_requirements=self._get_model_pip_requirements(),
                     signature=self._get_model_signature(),
-                    # Our model expects a Python dictionary, so we want to save the
-                    # input example directly as it is by setting`example_no_conversion`
-                    # to `True`.
+                    # Set example_no_conversion to True for saving input examples directly
                     example_no_conversion=True,
                 )
         else:
             logging.info(
-                "The accuracy of the model (%.2f) is lower than the accuracy threshold "
-                "(%.2f). Skipping model registration.",
+                "Current model accuracy (%f) is not higher than the latest model accuracy (%f). Model registration skipped.",
                 self.accuracy,
-                self.accuracy_threshold,
+                latest_accuracy,
             )
 
-        # Let's now move to the final step of the pipeline.
+        # Proceed to the end step
         self.next(self.end)
+
 
     @step
     def end(self):

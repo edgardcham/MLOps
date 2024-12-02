@@ -35,55 +35,96 @@ TRAINING_BATCH_SIZE = 32
 class FlowMixin:
     """Base class used to share code across multiple pipelines."""
 
-    dataset = IncludeFile(
-        "penguins",
-        is_text=True,
-        help=(
-            "Local copy of the penguins dataset. This file will be included in the "
-            "flow and will be used whenever the flow is executed in development mode."
-        ),
-        default="data/penguins.csv",
-    )
+
+    # For the include file pipeline, since it is reusable, good idea to use it in a common file/class
+    # This will basically include the file in the pipeline where it's called
+
+    # I can disregard the following, if we change the code to load all CSVs in the dataset.
+    # dataset = IncludeFile(
+    #     "penguins",
+    #     is_text=True,
+    #     help=(
+    #         "Local copy of the penguins dataset. This file will be included in the "
+    #         "flow and will be used whenever the flow is executed in development mode."
+    #     ),
+    #     default="data/penguins.csv",
+    # )
+
+    # MODIFIED TO LOAD AN ENTIRE DIR INSTEAD OF A FOLDER IN DEVELOPMENT.
+
+    # def load_dataset(self):
+    #     """Load and prepare the dataset.
+
+    #     When running in production mode, this function reads every CSV file available in
+    #     the supplied S3 location and concatenates them into a single dataframe. When
+    #     running in development mode, this function reads the dataset from the supplied
+    #     string parameter.
+    #     """
+    #     import numpy as np
+
+    #     # When in production mode, load data from S3 bucket.
+    #     if current.is_production:
+    #         dataset = os.environ.get("DATASET", self.dataset)
+    #         # Point to a location in S3 and load all files and concatenate them
+    #         with S3(s3root=dataset) as s3:
+    #             files = s3.get_all()
+
+    #             logging.info("Found %d file(s) in remote location", len(files))
+
+    #             raw_data = [pd.read_csv(StringIO(file.text)) for file in files]
+    #             data = pd.concat(raw_data)
+    #     else:
+    #         # When running in development mode, the raw data is passed as a string,
+    #         # so we can convert it to a DataFrame.
+    #         data = pd.read_csv(StringIO(self.dataset))
+
+    #     # Replace extraneous values in the sex column with NaN. We can handle missing
+    #     # values later in the pipeline.
+    #     data["sex"] = data["sex"].replace(".", np.nan)
+
+    #     # We want to shuffle the dataset. For reproducibility, we can fix the seed value
+    #     # when running in development mode. When running in production mode, we can use
+    #     # the current time as the seed to ensure a different shuffle each time the
+    #     # pipeline is executed.
+    #     seed = int(time.time() * 1000) if current.is_production else 42
+    #     generator = np.random.default_rng(seed=seed)
+    #     data = data.sample(frac=1, random_state=generator)
+
+    #     logging.info("Loaded dataset with %d samples", len(data))
+
+    #     return data
 
     def load_dataset(self):
         """Load and prepare the dataset.
 
-        When running in production mode, this function reads every CSV file available in
-        the supplied S3 location and concatenates them into a single dataframe. When
-        running in development mode, this function reads the dataset from the supplied
-        string parameter.
+        This function reads all CSV files from a folder (local or S3) and combines them.
         """
         import numpy as np
 
         if current.is_production:
-            dataset = os.environ.get("DATASET", self.dataset)
-
-            with S3(s3root=dataset) as s3:
+            dataset_folder = os.environ.get("DATASET_FOLDER")
+            with S3(s3root=dataset_folder) as s3:
                 files = s3.get_all()
-
                 logging.info("Found %d file(s) in remote location", len(files))
-
-                raw_data = [pd.read_csv(StringIO(file.text)) for file in files]
+                raw_data = [pd.read_csv(StringIO(file.text)) for file in files if file.key.endswith(".csv")]
                 data = pd.concat(raw_data)
         else:
-            # When running in development mode, the raw data is passed as a string,
-            # so we can convert it to a DataFrame.
-            data = pd.read_csv(StringIO(self.dataset))
+            dataset_folder = Path(os.environ.get("DATASET_FOLDER", "data"))
+            if not dataset_folder.is_dir():
+                raise ValueError(f"Dataset path {dataset_folder} is not a directory.")
+            csv_files = list(dataset_folder.glob("*.csv"))
+            if not csv_files:
+                raise ValueError(f"No CSV files found in folder {dataset_folder}.")
+            logging.info("Found %d file(s) in local folder", len(csv_files))
+            raw_data = [pd.read_csv(csv_file) for csv_file in csv_files]
+            data = pd.concat(raw_data)
 
-        # Replace extraneous values in the sex column with NaN. We can handle missing
-        # values later in the pipeline.
         data["sex"] = data["sex"].replace(".", np.nan)
-
-        # We want to shuffle the dataset. For reproducibility, we can fix the seed value
-        # when running in development mode. When running in production mode, we can use
-        # the current time as the seed to ensure a different shuffle each time the
-        # pipeline is executed.
         seed = int(time.time() * 1000) if current.is_production else 42
         generator = np.random.default_rng(seed=seed)
         data = data.sample(frac=1, random_state=generator)
 
         logging.info("Loaded dataset with %d samples", len(data))
-
         return data
 
 
